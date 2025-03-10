@@ -8,6 +8,11 @@ from langchain_core.utils import guard_import
 
 from langchain_community.callbacks.utils import import_pandas
 
+import requests
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Define constants
 
 # LLMResult keys
@@ -333,3 +338,415 @@ class FiddlerCallbackHandler(BaseCallbackHandler):
         self._publish_events(
             run_id, [""] * len(self.run_id_prompts[run_id]), duration, FAILURE
         )
+
+class FiddlerSafetyGuardrailsCallbackHandler(BaseCallbackHandler):
+    """Callback Handler that integrates with an external guardrails API.
+    
+    This handler intercepts LLM responses and sends them to an external
+    guardrails API for content moderation. If the response exceeds the
+    configured threshold, it will be blocked and an error will be raised.
+    """
+
+    def __init__(
+        self,
+        api_url: str,
+        auth_token: str,
+        threshold: float = 0.1,
+        timeout: int = 5,
+        fallback_response: Optional[str] = None,
+    ) -> None:
+        """Initialize the GuardrailsCallbackHandler.
+        
+        Args:
+            api_url: The URL of the external guardrails API.
+            auth_token: The authentication token for the API.
+            threshold: The threshold for blocking responses (0.0 to 1.0).
+                Defaults to 0.5.
+            timeout: Timeout in seconds for API requests. Defaults to 5.
+            fallback_response: A fallback response to use when a response is
+                blocked and raise_error is False. Defaults to None.
+        """
+        super().__init__()
+        self.api_url = api_url
+        self.auth_token = auth_token
+        self.threshold = threshold
+        self.timeout = timeout
+        self.fallback_response = fallback_response
+        
+        # Store the original responses and their guardrail scores
+        self.response_scores: Dict[str, float] = {}
+        
+        # Store blocked run IDs
+        self.blocked_runs: set[UUID] = set()
+        
+        # Store input scores
+        self.input_scores: Dict[str, float] = {}
+        
+        # Validate configuration
+        if not api_url:
+            raise ValueError("api_url must be provided")
+        if not auth_token:
+            raise ValueError("auth_token must be provided")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be between 0.0 and 1.0")
+        self.api_url += "/v3/guardrails/ftl-safety"
+
+    def on_llm_start(
+        self,
+        serialized: Dict[str, Any],
+        prompts: List[str],
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Check user inputs against the guardrails API before LLM processing.
+        
+        Args:
+            serialized: The serialized LLM.
+            prompts: The prompts being sent to the LLM.
+            run_id: The ID of the run.
+            parent_run_id: The ID of the parent run.
+            **kwargs: Additional keyword arguments.
+        """
+        # Process each prompt (user input)
+        for prompt in prompts:
+            # Extract the user input from the prompt
+            # This is a simplified approach - you may need to adapt this based on
+            # your prompt structure to correctly extract just the user input portion
+            user_input = self._extract_user_input(prompt)
+            
+            if user_input:
+                # Check the user input against the guardrails API
+                is_blocked, score = self._check_guardrails(user_input)
+                
+                # Store the score for reference
+                self.input_scores[user_input] = score
+                
+                # If the input is blocked
+                if is_blocked:
+                    error_msg = (
+                        f"User input blocked by guardrails API with score {score} "
+                        f"(threshold: {self.threshold})"
+                    )
+                    logger.warning(error_msg)
+                    
+                    # Mark this run as blocked so we can replace the response later
+                    self.blocked_runs.add(run_id)
+
+    def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Replace responses for blocked inputs with the fallback message.
+        
+        Args:
+            response: The LLM result.
+            run_id: The ID of the run.
+            parent_run_id: The ID of the parent run.
+            **kwargs: Additional keyword arguments.
+        """
+        # Check if this run was blocked
+        if run_id in self.blocked_runs or (parent_run_id and parent_run_id in self.blocked_runs):
+            # Replace all generations with the fallback response
+            for generations in response.generations:
+                for generation in generations:
+                    generation.text = self.fallback_response
+                    if hasattr(generation, "message"):
+                        generation.message.content = self.fallback_response
+            
+            # Remove from blocked runs since we've handled it
+            if run_id in self.blocked_runs:
+                self.blocked_runs.remove(run_id)
+            if parent_run_id and parent_run_id in self.blocked_runs:
+                self.blocked_runs.remove(parent_run_id)
+
+    def _extract_user_input(self, prompt: str) -> Optional[str]:
+        """Extract the user input from a prompt.
+        
+        This is a simplified implementation. In practice, you'll need to adapt this
+        based on your specific prompt structure to correctly extract just the user input.
+        
+        Args:
+            prompt: The full prompt being sent to the LLM.
+            
+        Returns:
+            The extracted user input, or None if it couldn't be extracted.
+        """
+        # Simple implementation - assumes the last part of the prompt is the user input
+        # You'll need to customize this based on your prompt template structure
+        
+        # Example for a simple chat template where user messages are prefixed with "Human:"
+        lines = prompt.split("\n")
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].startswith("Human:"):
+                return lines[i][6:].strip()  # Remove "Human:" prefix
+        
+        # If we can't identify a specific user input, return the whole prompt
+        # This is a fallback approach - ideally you'd have a more precise extraction
+        return prompt
+
+    def _check_guardrails(self, text: str) -> tuple[bool, float]:
+        """Check the text against the guardrails API.
+        
+        Args:
+            text: The text to check.
+            
+        Returns:
+            A tuple of (is_blocked, score).
+        """
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.auth_token}",
+                "Content-Type": "application/json",
+            }
+            
+            payload = {
+                "data": {
+                    "prompt": [
+                        text
+                    ]
+                }
+            }
+            
+            response = requests.post(
+                self.api_url,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
+            )
+            
+            # Check if the request was successful
+            response.raise_for_status()
+            
+            # Parse the response
+            result = response.json()
+            
+            # Extract the score (adjust this based on your API's response format)
+            score = result[0].get("any_score", 2)
+
+            if score == 2:
+                raise ValueError("Invalid score received from guardrails API")
+            
+            # Determine if the response should be blocked
+            is_blocked = score >= self.threshold
+            
+            return is_blocked, score
+            
+        except Exception as e:
+            logger.error(f"Error checking guardrails API: {e}")
+            # Default to not blocking if there's an error with the API
+            return False, 0.0
+
+    def get_response_score(self, text: str) -> Optional[float]:
+        """Get the guardrail score for a specific response.
+        
+        Args:
+            text: The response text to get the score for.
+            
+        Returns:
+            The score if available, or None if the response hasn't been checked.
+        """
+        return self.response_scores.get(text)
+
+class FiddlerFaithfulnessGuardrailsCallbackHandler(BaseCallbackHandler):
+    """Callback Handler for RAG systems with guardrails integration.
+    
+    This handler captures both the context from retrievers and the LLM responses
+    to provide comprehensive guardrails that can analyze the relationship between
+    context and generated content.
+    """
+
+    def __init__(
+        self,
+        api_url: str,
+        auth_token: str,
+        threshold: float = 0.005,
+        timeout: int = 5,
+        raise_error: bool = True,
+        fallback_response: Optional[str] = None,
+    ) -> None:
+        """Initialize the RAGGuardrailsCallbackHandler.
+        
+        Args:
+            api_url: The URL of the external guardrails API.
+            auth_token: The authentication token for the API.
+            threshold: The threshold for blocking responses (0.0 to 1.0).
+                Defaults to 0.5.
+            timeout: Timeout in seconds for API requests. Defaults to 5.
+            raise_error: Whether to raise an error when a response is blocked.
+                Defaults to True.
+            fallback_response: A fallback response to use when a response is
+                blocked and raise_error is False. Defaults to None.
+        """
+        super().__init__()
+        self.api_url = api_url
+        self.auth_token = auth_token
+        self.threshold = threshold
+        self.timeout = timeout
+        self.raise_error = raise_error
+        self.fallback_response = fallback_response
+        
+        # Store the retrieved documents for each run
+        self.retrieved_documents: Dict[UUID, List[str]] = {}
+        
+        # Store the prompts for each run
+        self.prompts: Dict[UUID, str] = {}
+        
+        # Store the original responses and their guardrail scores
+        self.response_scores: Dict[str, float] = {}
+        
+        # Validate configuration
+        if not api_url:
+            raise ValueError("api_url must be provided")
+        if not auth_token:
+            raise ValueError("auth_token must be provided")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be between 0.0 and 1.0")
+
+        self.api_url += "/v3/guardrails/ftl-response-faithfulness"
+
+    def on_retriever_end(
+        self,
+        documents: Sequence[Document],
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Capture the retrieved documents.
+        
+        Args:
+            documents: The retrieved documents.
+            run_id: The ID of the run.
+            parent_run_id: The ID of the parent run.
+            **kwargs: Additional keyword arguments.
+        """
+        # Store the document contents for this run
+        self.retrieved_documents[run_id] = [doc.page_content for doc in documents]
+        
+        # If there's a parent run, also store under the parent run ID
+        if parent_run_id:
+            if parent_run_id not in self.retrieved_documents:
+                self.retrieved_documents[parent_run_id] = []
+            self.retrieved_documents[parent_run_id].extend([doc.page_content for doc in documents])
+
+    def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Check the LLM response against the guardrails API.
+        
+        Args:
+            response: The LLM result to check.
+            run_id: The ID of the run.
+            parent_run_id: The ID of the parent run.
+            **kwargs: Additional keyword arguments.
+            
+        Raises:
+            ValueError: If the response is blocked by the guardrails API and
+                raise_error is True.
+        """
+        # Get the context for this run
+        context = self.retrieved_documents.get(run_id, [])
+        if not context and parent_run_id:
+            context = self.retrieved_documents.get(parent_run_id, [])
+        
+        # Process each generation in the response
+        for generations in response.generations:
+            for generation in generations:
+                # Check the text against the guardrails API
+                is_blocked, score = self._check_guardrails(
+                    response_text=generation.text,
+                    context=context,
+                )
+                
+                # Store the score for reference
+                self.response_scores[generation.text] = score
+                
+                # If the response is blocked and we're configured to raise an error
+                if is_blocked and self.raise_error:
+                    error_msg = (
+                        f"Response blocked by guardrails API with score {score} "
+                        f"(threshold: {self.threshold})"
+                    )
+                    logger.warning(error_msg)
+                    raise ValueError(error_msg)
+                
+                # If the response is blocked and we have a fallback
+                if is_blocked and self.fallback_response is not None:
+                    # Modify the generation in place
+                    generation.text = self.fallback_response
+                    if hasattr(generation, "message"):
+                        generation.message.content = self.fallback_response
+
+    def _check_guardrails(
+        self, 
+        response_text: str, 
+        context: List[str],
+    ) -> tuple[bool, float]:
+        """Check the response against the guardrails API, including context.
+        
+        Args:
+            response_text: The LLM response text to check.
+            context: The retrieved document contents.
+            prompt: The prompt sent to the LLM.
+            
+        Returns:
+            A tuple of (is_blocked, score).
+        """
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.auth_token}",
+                "Content-Type": "application/json",
+            }
+            
+            payload = {
+                "response": response_text,
+                "context": context,
+            }
+            
+            response = requests.post(
+                self.api_url,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
+            )
+            
+            # Check if the request was successful
+            response.raise_for_status()
+            
+            # Parse the response
+            result = response.json()
+            
+            # Extract the score (adjust this based on your API's response format)
+            score = result.get("score", 0.0)
+            
+            # Determine if the response should be blocked
+            is_blocked = score >= self.threshold
+            
+            return is_blocked, score
+            
+        except Exception as e:
+            logger.error(f"Error checking guardrails API: {e}")
+            # Default to not blocking if there's an error with the API
+            return False, 0.0
+
+    def get_response_score(self, text: str) -> Optional[float]:
+        """Get the guardrail score for a specific response.
+        
+        Args:
+            text: The response text to get the score for.
+            
+        Returns:
+            The score if available, or None if the response hasn't been checked.
+        """
+        return self.response_scores.get(text)
